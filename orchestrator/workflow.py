@@ -60,7 +60,7 @@ async def run_workflow(repo_url: str, commit_sha: str) -> Dict[str, Any]:
     local_repo_path = await scanner.clone_repo(repo_url=repo_url, dest_dir=str(work_dir))
     logger.info("[workflow] clone complete path=%s", local_repo_path)
 
-    logger.info("[workflow] scanning dependencies (npm audit)")
+    logger.info("[workflow] scanning dependencies (npm + python)")
     findings: List[VulnerabilityFinding] = await scanner.scan(local_repo_path)
     if not findings:
         report_path = _write_report(
@@ -106,7 +106,7 @@ async def run_workflow(repo_url: str, commit_sha: str) -> Dict[str, Any]:
             remediation_results.append(rr)
             logger.info("[workflow] remediation applied %s: %s -> %s (llm_used=%s)", rr.dependency, rr.old_version, rr.new_version, rr.llm_used)
 
-        logger.info("[workflow] validating remediation via npm audit")
+        logger.info("[workflow] validating remediation via dependency rescans")
         last_validation = await validation_agent.validate(local_repo_path, expected_fixed=analyses)
         logger.info("[workflow] validation passed=%s", last_validation.passed)
         if last_validation.passed:

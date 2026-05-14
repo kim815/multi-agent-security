@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class VulnerabilityFinding:
+    ecosystem: str
     package: str
     severity: str
     vulnerable_version: str
@@ -49,18 +50,47 @@ class ScannerAgent:
 
     async def scan(self, repo_path: str) -> List[VulnerabilityFinding]:
         repo_dir = Path(repo_path)
+        findings: List[VulnerabilityFinding] = []
+
         package_json = repo_dir / "package.json"
-        if not package_json.exists():
+        if package_json.exists():
+            # Install dependencies (use clean install where possible)
+            await self._run_cmd(["npm", "install"], cwd=repo_dir)
+
+            audit_json = await self._run_cmd(["npm", "audit", "--json"], cwd=repo_dir, allow_failure=True)
+            findings.extend(self._parse_npm_audit_json(audit_json))
+        else:
             logger.info("No package.json found at %s", package_json)
-            return []
 
-        # Install dependencies (use clean install where possible)
-        await self._run_cmd(["npm", "install"], cwd=repo_dir)
+        # Python dependency scanning
+        py_findings = await self.scan_python(repo_path)
+        findings.extend(py_findings)
 
-        audit_json = await self._run_cmd(["npm", "audit", "--json"], cwd=repo_dir, allow_failure=True)
-        findings = self._parse_npm_audit_json(audit_json)
         logger.info("Scanner found %d vulnerability finding(s)", len(findings))
         return findings
+
+    async def scan_python(self, repo_path: str) -> List[VulnerabilityFinding]:
+        """Detect python dependency vulnerabilities using pip-audit.
+
+        Supported inputs for MVP:
+        - requirements.txt (common)
+
+        Notes:
+        - We do NOT create or modify environments here.
+        - pip-audit will be invoked with -r requirements.txt.
+        """
+
+        repo_dir = Path(repo_path)
+        req = repo_dir / "requirements.txt"
+        if not req.exists():
+            return []
+
+        audit_json = await self._run_cmd(
+            ["pip-audit", "-r", str(req), "-f", "json"],
+            cwd=repo_dir,
+            allow_failure=True,
+        )
+        return self._parse_pip_audit_json(audit_json)
 
     async def _run_cmd(self, args: List[str], cwd: Path, allow_failure: bool = False) -> str:
         logger.info("Running command: %s (cwd=%s)", " ".join(args), cwd)
@@ -98,6 +128,7 @@ class ScannerAgent:
 
             vulns.append(
                 VulnerabilityFinding(
+                    ecosystem="npm",
                     package=module or "",
                     severity=severity,
                     vulnerable_version=vulnerable_versions,
@@ -143,6 +174,7 @@ class ScannerAgent:
 
             vulns.append(
                 VulnerabilityFinding(
+                    ecosystem="npm",
                     package=pkg,
                     severity=severity,
                     vulnerable_version=range_ or "",
@@ -178,6 +210,156 @@ class ScannerAgent:
         # Stable order for reports
         uniq.sort(key=lambda x: (x.package, x.severity))
         return uniq
+
+    def _parse_pip_audit_json(self, audit_output: str) -> List[VulnerabilityFinding]:
+        """Parse pip-audit JSON output.
+
+        Expected shape (pip-audit -f json):
+        [
+          {
+            "name": "requests",
+            "version": "2.19.0",
+            "vulns": [
+              {
+                "id": "PYSEC-...",
+                "aliases": ["CVE-...."],
+                "description": "...",
+                "fix_versions": ["2.20.0"],
+                ...
+              }
+            ]
+          }
+        ]
+
+        Some environments may inject extra output; reuse first-JSON-object extraction but allow a list.
+        """
+
+        s = audit_output.lstrip()
+        # Fast path: full JSON
+        try:
+            obj = json.loads(s)
+        except json.JSONDecodeError:
+            obj = None
+
+        if obj is None:
+            # Best-effort: try to extract a JSON array region.
+            obj = self._loads_first_json_array(s)
+
+        if not isinstance(obj, list):
+            return []
+
+        findings: List[VulnerabilityFinding] = []
+        for dep in obj:
+            if not isinstance(dep, dict):
+                continue
+            name = dep.get("name") or ""
+            version = dep.get("version") or ""
+            vulns = dep.get("vulns") or []
+            if not name or not isinstance(vulns, list):
+                continue
+
+            # Aggregate all fix versions across vulns so we can recommend a version that
+            # clears *all* advisories for this package.
+            all_fix_versions: list[str] = []
+            for v in vulns:
+                if not isinstance(v, dict):
+                    continue
+                fix_versions = v.get("fix_versions") or []
+                if isinstance(fix_versions, list):
+                    all_fix_versions.extend([fv for fv in fix_versions if isinstance(fv, str)])
+            patched = ""
+            if all_fix_versions:
+                # Best-effort semver-ish max (lexicographic on tuples). If parsing fails, keep last.
+                def _key(ver: str) -> tuple:
+                    parts = re.findall(r"\d+", ver)
+                    return tuple(int(p) for p in parts[:3]) if parts else (0,)
+
+                try:
+                    best_fix = max(all_fix_versions, key=_key)
+                except Exception:
+                    best_fix = all_fix_versions[-1]
+                patched = f">={best_fix}"
+
+            for v in vulns:
+                if not isinstance(v, dict):
+                    continue
+                aliases = v.get("aliases") or []
+                cve = ""
+                if isinstance(aliases, list):
+                    for a in aliases:
+                        if isinstance(a, str) and a.upper().startswith("CVE-"):
+                            cve = a
+                            break
+                vuln_id = v.get("id")
+                if not cve and isinstance(vuln_id, str):
+                    cve = vuln_id
+
+                desc = (v.get("description") or "").strip()
+                recommendation = "Upgrade dependency"
+                findings.append(
+                    VulnerabilityFinding(
+                        ecosystem="python",
+                        package=name,
+                        severity="unknown",
+                        vulnerable_version=str(version),
+                        patched_version=patched,
+                        cve=cve,
+                        overview=desc,
+                        recommendation=recommendation,
+                    )
+                )
+
+        # Deduplicate by (ecosystem, package)
+        best: Dict[tuple[str, str], VulnerabilityFinding] = {}
+        for f in findings:
+            key = (f.ecosystem, f.package)
+            curr = best.get(key)
+            if curr is None:
+                best[key] = f
+                continue
+            curr_has_ver = bool(re.search(r"\d+\.\d+\.\d+", curr.patched_version or ""))
+            f_has_ver = bool(re.search(r"\d+\.\d+\.\d+", f.patched_version or ""))
+            if f_has_ver and not curr_has_ver:
+                best[key] = f
+
+        uniq = list(best.values())
+        uniq.sort(key=lambda x: (x.ecosystem, x.package))
+        return uniq
+
+    def _loads_first_json_array(self, s: str) -> Any:
+        """Extract and parse the first top-level JSON array in a string."""
+
+        start = s.find("[")
+        if start == -1:
+            raise json.JSONDecodeError("No JSON array start found", s, 0)
+
+        depth = 0
+        in_str = False
+        esc = False
+        for i in range(start, len(s)):
+            ch = s[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+
+            if ch == '"':
+                in_str = True
+                continue
+
+            if ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+                if depth == 0:
+                    candidate = s[start : i + 1]
+                    return json.loads(candidate)
+
+        raise json.JSONDecodeError("Unterminated JSON array", s, start)
 
     def _loads_first_json_object(self, s: str) -> Dict[str, Any]:
         """Extract and parse the first top-level JSON object in a string.

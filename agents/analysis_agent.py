@@ -7,6 +7,7 @@ from agents.scanner_agent import VulnerabilityFinding
 
 @dataclass
 class AnalysisResult:
+    ecosystem: str
     dependency: str
     issue_type: str
     severity: str
@@ -25,7 +26,7 @@ class AnalysisAgent:
 
     def analyze(self, finding: VulnerabilityFinding) -> AnalysisResult:
         issue_type = self._infer_issue_type(finding.overview)
-        recommended_version = self._infer_recommended_version(finding.patched_version)
+        recommended_version = self._infer_recommended_version(finding.patched_version, ecosystem=finding.ecosystem)
 
         explanation = (
             f"Dependency '{finding.package}' is vulnerable ({finding.severity}). "
@@ -34,6 +35,7 @@ class AnalysisAgent:
         ).strip()
 
         return AnalysisResult(
+            ecosystem=finding.ecosystem,
             dependency=finding.package,
             issue_type=issue_type,
             severity=finding.severity.upper(),
@@ -58,10 +60,21 @@ class AnalysisAgent:
             return "CSRF Vulnerability"
         return "Dependency Vulnerability"
 
-    def _infer_recommended_version(self, patched_versions: str) -> str:
-        # patched_versions often like ">=1.6.0"; convert to caret for demo friendliness.
-        match = re.search(r"(\d+\.\d+\.\d+)", patched_versions or "")
-        if match:
-            return f"^{match.group(1)}"
+    def _infer_recommended_version(self, patched_versions: str, ecosystem: str) -> str:
+        """Infer a safe version specifier.
+
+        - npm: prefer caret range (demo-friendly)
+        - python: prefer pinned '==x.y.z' (requirements.txt-friendly)
+        """
+
+        versions = re.findall(r"(\d+\.\d+\.\d+)", patched_versions or "")
+        if versions:
+            # npm audit output typically has one fixed version; pip-audit may yield multiple
+            # across runs/merged advisories. Pick the last one as a simple "highest" heuristic.
+            ver = versions[-1]
+            if ecosystem == "python":
+                return f"=={ver}"
+            return f"^{ver}"
+
         # fallback
-        return "latest"
+        return "latest" if ecosystem == "npm" else ""
