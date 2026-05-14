@@ -119,9 +119,33 @@ class PRAgent:
         }
         payload = {"title": title, "body": body, "head": head, "base": base}
         resp = requests.post(url, headers=headers, json=payload, timeout=30)
+        # If a PR already exists for the same head/base, GitHub returns 422.
+        # Make this idempotent by fetching and returning the existing PR.
+        if resp.status_code == 422:
+            existing = self._find_existing_pr(token, owner, repo, head=head, base=base)
+            if existing:
+                return existing
         if resp.status_code >= 400:
             raise RuntimeError(f"Failed to create PR: {resp.status_code} {resp.text}")
         return resp.json()
+
+    def _find_existing_pr(self, token: str, owner: str, repo: str, head: str, base: str) -> Optional[Dict[str, Any]]:
+        """Return existing open PR matching head/base, if any."""
+        url = f"https://api.github.com/repos/{owner}/{repo}/pulls"
+        headers = {
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github+json",
+        }
+        params = {"state": "open", "base": base, "per_page": 100}
+        resp = requests.get(url, headers=headers, params=params, timeout=30)
+        if resp.status_code >= 400:
+            return None
+
+        # GitHub returns head.ref (branch name) and head.label (owner:branch).
+        for pr in resp.json():
+            if pr.get("head", {}).get("ref") == head and pr.get("base", {}).get("ref") == base:
+                return pr
+        return None
 
     def _parse_owner_repo(self, repo_url: str) -> Tuple[Optional[str], Optional[str]]:
         # Supports https://github.com/owner/repo(.git)

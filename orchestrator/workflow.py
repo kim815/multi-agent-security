@@ -125,8 +125,9 @@ async def run_workflow(repo_url: str, commit_sha: str) -> Dict[str, Any]:
     report_path = _write_report(workflow_id=workflow_id, report=report)
 
     pr_info: Optional[Dict[str, Any]] = None
-    if os.getenv("GITHUB_TOKEN"):
+    if os.getenv("GITHUB_TOKEN") and last_validation and last_validation.passed:
         pr_agent = PRAgent()
+        logger.info("[workflow] creating PR for branch=%s", f"security-fix/{workflow_id}")
         pr_info = await pr_agent.create_pr_if_possible(
             local_repo_path=local_repo_path,
             repo_url=repo_url,
@@ -135,6 +136,10 @@ async def run_workflow(repo_url: str, commit_sha: str) -> Dict[str, Any]:
             title="Automated Security Fix: dependency vulnerability remediation",
             body=f"Automated remediation report: {Path(report_path).name}",
         )
+        if pr_info and pr_info.get("html_url"):
+            logger.info("[workflow] PR ready: %s", pr_info.get("html_url"))
+    elif os.getenv("GITHUB_TOKEN"):
+        logger.info("[workflow] skipping PR creation (validation did not pass)")
 
     return asdict(
         WorkflowResult(
