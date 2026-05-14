@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import requests
 from git import Repo
+from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +39,7 @@ class PRAgent:
             return None
 
         repo_obj = Repo(local_repo_path)
-        await asyncio.to_thread(self._git_commit_and_push, repo_obj, branch_name)
+        await asyncio.to_thread(self._git_commit_and_push, repo_obj, repo_url, token, branch_name)
 
         pr = await asyncio.to_thread(
             self._open_pr,
@@ -52,7 +53,7 @@ class PRAgent:
         )
         return pr
 
-    def _git_commit_and_push(self, repo_obj: Repo, branch_name: str) -> None:
+    def _git_commit_and_push(self, repo_obj: Repo, repo_url: str, token: str, branch_name: str) -> None:
         # Create branch
         if branch_name in [h.name for h in repo_obj.heads]:
             repo_obj.git.checkout(branch_name)
@@ -66,12 +67,49 @@ class PRAgent:
 
         repo_obj.index.commit("Automated security remediation")
 
+        # Ensure the push uses token-based HTTPS auth (avoids relying on local
+        # credential helpers, which can cause confusing 403s in CI/demo envs).
+        self._ensure_origin_uses_token(repo_obj, repo_url, token)
+
         # Push
         try:
             repo_obj.git.push("-u", "origin", branch_name)
         except Exception:
             logger.exception("Failed to push branch")
             raise
+
+    def _ensure_origin_uses_token(self, repo_obj: Repo, repo_url: str, token: str) -> None:
+        """Force the `origin` remote to use an x-access-token HTTPS URL.
+
+        GitHub accepts the form:
+        https://x-access-token:<TOKEN>@github.com/<owner>/<repo>.git
+        """
+
+        origin = None
+        try:
+            origin = repo_obj.remotes.origin
+        except Exception:
+            origin = None
+
+        owner, repo = self._parse_owner_repo(repo_url)
+        if not owner or not repo:
+            logger.warning("Could not parse owner/repo from %s; leaving origin unchanged", repo_url)
+            return
+
+        # Token may contain characters that must be URL-encoded for basic auth.
+        safe_token = quote(token, safe="")
+        token_remote = f"https://x-access-token:{safe_token}@github.com/{owner}/{repo}.git"
+
+        if origin is None:
+            repo_obj.create_remote("origin", token_remote)
+            return
+
+        current_urls = list(origin.urls)
+        if current_urls and any(u.startswith("https://x-access-token:") for u in current_urls):
+            return
+
+        # Replace existing URL(s) with token remote.
+        repo_obj.git.remote("set-url", "origin", token_remote)
 
     def _open_pr(self, token: str, owner: str, repo: str, title: str, body: str, head: str, base: str) -> Dict[str, Any]:
         url = f"https://api.github.com/repos/{owner}/{repo}/pulls"
