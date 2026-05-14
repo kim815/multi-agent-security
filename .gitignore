@@ -1,0 +1,24 @@
+# Environment secrets
+.env
+.env.*
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Local agent run artifacts
+results/
+
+# Sandbox repo clones (these are full git repos, don't commit into this project)
+sandbox/repo_clones/
+# Node
+node_modules/
+
+# OS
+.DS_Store
