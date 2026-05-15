@@ -1,0 +1,6 @@
+{
+  "include": ["api", "agents", "orchestrator"],
+  "venvPath": ".",
+  "venv": ".venv",
+  "reportMissingImports": "none"
+}

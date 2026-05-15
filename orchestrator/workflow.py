@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -33,7 +34,11 @@ class WorkflowResult:
     pr: Optional[Dict[str, Any]] = None
 
 
-async def run_workflow(repo_url: str, commit_sha: str) -> Dict[str, Any]:
+async def run_workflow(
+    repo_url: str,
+    commit_sha: str,
+    emitter: Any | None = None,
+) -> Dict[str, Any]:
     """End-to-end MVP workflow.
 
     Contract:
@@ -57,11 +62,34 @@ async def run_workflow(repo_url: str, commit_sha: str) -> Dict[str, Any]:
 
     logger.info("[workflow] starting id=%s repo=%s commit=%s", workflow_id, repo_url, commit_sha)
     logger.info("[workflow] cloning into %s", work_dir)
-    local_repo_path = await scanner.clone_repo(repo_url=repo_url, dest_dir=str(work_dir))
+    if emitter:
+        await emitter.emit_agent_started("scanner_agent")
+
+    try:
+        local_repo_path = await scanner.clone_repo(repo_url=repo_url, dest_dir=str(work_dir))
+    except Exception as e:
+        if emitter:
+            await emitter.emit_agent_failed("scanner_agent", message="Repo clone failed", details=str(e))
+            await emitter.emit_workflow_completed(status="failed", error={"message": "Repo clone failed", "details": str(e)})
+        raise
+
     logger.info("[workflow] clone complete path=%s", local_repo_path)
 
     logger.info("[workflow] scanning dependencies (npm + python)")
-    findings: List[VulnerabilityFinding] = await scanner.scan(local_repo_path)
+    try:
+        findings: List[VulnerabilityFinding] = await scanner.scan(local_repo_path)
+    except Exception as e:
+        if emitter:
+            await emitter.emit_agent_failed("scanner_agent", message="Dependency scan failed", details=str(e))
+            await emitter.emit_workflow_completed(status="failed", error={"message": "Dependency scan failed", "details": str(e)})
+        raise
+
+    if emitter:
+        await emitter.emit_agent_completed(
+            "scanner_agent",
+            {"findings": [asdict(f) for f in findings]},
+        )
+
     if not findings:
         report_path = _write_report(
             workflow_id=workflow_id,
@@ -72,6 +100,14 @@ async def run_workflow(repo_url: str, commit_sha: str) -> Dict[str, Any]:
                 "status": "no_vulnerabilities",
             },
         )
+
+        if emitter:
+            await emitter.emit_workflow_completed(
+                status="completed",
+                message="No vulnerabilities detected",
+                summary={"total_vulnerabilities": 0, "remediated": 0, "validation": "skipped"},
+            )
+
         return asdict(
             WorkflowResult(
                 repo_url=repo_url,
@@ -86,7 +122,22 @@ async def run_workflow(repo_url: str, commit_sha: str) -> Dict[str, Any]:
         )
 
     logger.info("[workflow] analyzing %d finding(s)", len(findings))
-    analyses: List[AnalysisResult] = [analysis_agent.analyze(f) for f in findings]
+    if emitter:
+        await emitter.emit_agent_started("analysis_agent")
+
+    try:
+        analyses: List[AnalysisResult] = [analysis_agent.analyze(f) for f in findings]
+    except Exception as e:
+        if emitter:
+            await emitter.emit_agent_failed("analysis_agent", message="Analysis failed", details=str(e))
+            await emitter.emit_workflow_completed(status="failed", error={"message": "Analysis failed", "details": str(e)})
+        raise
+
+    if emitter:
+        await emitter.emit_agent_completed(
+            "analysis_agent",
+            {"analysis": [asdict(a) for a in analyses]},
+        )
 
     remediation_results: List[RemediationResult] = []
     last_validation: Optional[ValidationResult] = None
@@ -96,18 +147,63 @@ async def run_workflow(repo_url: str, commit_sha: str) -> Dict[str, Any]:
         logger.info("[workflow] remediation attempt %s/3", attempt)
 
         remediation_results = []
-        for ar in analyses:
-            logger.info("[workflow] remediating dependency=%s recommended=%s", ar.dependency, ar.recommended_version)
-            rr = await remediation_agent.remediate(
-                local_repo_path,
-                ar,
-                validation_feedback=(last_validation.details if last_validation else None),
+        if emitter:
+            await emitter.emit_agent_started("remediation_agent")
+
+        try:
+            for ar in analyses:
+                if emitter and getattr(emitter, "cancel_event", None) and emitter.cancel_event.is_set():
+                    raise asyncio.CancelledError("Client disconnected")
+
+                logger.info("[workflow] remediating dependency=%s recommended=%s", ar.dependency, ar.recommended_version)
+                rr = await remediation_agent.remediate(
+                    local_repo_path,
+                    ar,
+                    validation_feedback=(last_validation.details if last_validation else None),
+                )
+                remediation_results.append(rr)
+                logger.info(
+                    "[workflow] remediation applied %s: %s -> %s (llm_used=%s)",
+                    rr.dependency,
+                    rr.old_version,
+                    rr.new_version,
+                    rr.llm_used,
+                )
+        except asyncio.CancelledError:
+            if emitter:
+                await emitter.emit_agent_failed("remediation_agent", message="Workflow cancelled", details="Client disconnected")
+                await emitter.emit_workflow_completed(status="failed", error={"message": "Workflow cancelled"})
+            raise
+        except Exception as e:
+            if emitter:
+                await emitter.emit_agent_failed("remediation_agent", message="Remediation failed", details=str(e))
+                await emitter.emit_workflow_completed(status="failed", error={"message": "Remediation failed", "details": str(e)})
+            raise
+
+        if emitter:
+            await emitter.emit_agent_completed(
+                "remediation_agent",
+                {"remediation": [asdict(r) for r in remediation_results]},
             )
-            remediation_results.append(rr)
-            logger.info("[workflow] remediation applied %s: %s -> %s (llm_used=%s)", rr.dependency, rr.old_version, rr.new_version, rr.llm_used)
 
         logger.info("[workflow] validating remediation via dependency rescans")
-        last_validation = await validation_agent.validate(local_repo_path, expected_fixed=analyses)
+        if emitter:
+            await emitter.emit_agent_started("validation_agent")
+
+        try:
+            last_validation = await validation_agent.validate(local_repo_path, expected_fixed=analyses)
+        except Exception as e:
+            if emitter:
+                await emitter.emit_agent_failed("validation_agent", message="Validation failed", details=str(e))
+                await emitter.emit_workflow_completed(status="failed", error={"message": "Validation failed", "details": str(e)})
+            raise
+
+        if emitter:
+            await emitter.emit_agent_completed(
+                "validation_agent",
+                {"validation": asdict(last_validation)},
+            )
+
         logger.info("[workflow] validation passed=%s", last_validation.passed)
         if last_validation.passed:
             break
@@ -128,18 +224,47 @@ async def run_workflow(repo_url: str, commit_sha: str) -> Dict[str, Any]:
     if os.getenv("GITHUB_TOKEN") and last_validation and last_validation.passed:
         pr_agent = PRAgent()
         logger.info("[workflow] creating PR for branch=%s", f"security-fix/{workflow_id}")
-        pr_info = await pr_agent.create_pr_if_possible(
-            local_repo_path=local_repo_path,
-            repo_url=repo_url,
-            base_branch=os.getenv("GITHUB_BASE_BRANCH", "main"),
-            branch_name=f"security-fix/{workflow_id}",
-            title="Automated Security Fix: dependency vulnerability remediation",
-            body=f"Automated remediation report: {Path(report_path).name}",
-        )
+        if emitter:
+            await emitter.emit_agent_started("pr_agent")
+
+        try:
+            pr_info = await pr_agent.create_pr_if_possible(
+                local_repo_path=local_repo_path,
+                repo_url=repo_url,
+                base_branch=os.getenv("GITHUB_BASE_BRANCH", "main"),
+                branch_name=f"security-fix/{workflow_id}",
+                title="Automated Security Fix: dependency vulnerability remediation",
+                body=f"Automated remediation report: {Path(report_path).name}",
+            )
+        except Exception as e:
+            if emitter:
+                await emitter.emit_agent_failed("pr_agent", message="PR creation failed", details=str(e))
+                await emitter.emit_workflow_completed(status="failed", error={"message": "PR creation failed", "details": str(e)})
+            raise
+
+        if emitter:
+            await emitter.emit_agent_completed("pr_agent", {"pr": pr_info or {}})
+
         if pr_info and pr_info.get("html_url"):
             logger.info("[workflow] PR ready: %s", pr_info.get("html_url"))
     elif os.getenv("GITHUB_TOKEN"):
         logger.info("[workflow] skipping PR creation (validation did not pass)")
+
+    if emitter:
+        if last_validation and last_validation.passed:
+            await emitter.emit_workflow_completed(
+                status="completed",
+                summary={
+                    "total_vulnerabilities": len(findings),
+                    "remediated": len(remediation_results),
+                    "validation": "passed",
+                },
+            )
+        else:
+            await emitter.emit_workflow_completed(
+                status="failed",
+                error={"message": "Validation failed"},
+            )
 
     return asdict(
         WorkflowResult(

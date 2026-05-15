@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from dotenv import load_dotenv
 
 from orchestrator.github_webhook import router as github_router
+from api.routes.workflow import router as workflow_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -16,6 +17,7 @@ load_dotenv()
 
 app = FastAPI(title="Multi-Agent Security Orchestrator", version="0.1.0")
 app.include_router(github_router)
+app.include_router(workflow_router)
 
 
 @app.get("/health")
