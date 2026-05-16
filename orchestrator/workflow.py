@@ -252,12 +252,16 @@ async def run_workflow(
 
     if emitter:
         if last_validation and last_validation.passed:
+            pr_url = None
+            if pr_info and isinstance(pr_info, dict):
+                pr_url = pr_info.get("html_url")
             await emitter.emit_workflow_completed(
                 status="completed",
                 summary={
                     "total_vulnerabilities": len(findings),
                     "remediated": len(remediation_results),
                     "validation": "passed",
+                    "pr_url": pr_url,
                 },
             )
         else:

@@ -26,12 +26,28 @@ class OpenAIClient:
 
     def __init__(self) -> None:
         self.api_key = os.getenv("OPENAI_API_KEY")
+        # Model and optional base URL (for proxies or hosted endpoints)
         self.model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        self.base_url = os.getenv("OPENAI_BASE_URL")
 
         if not self.api_key:
             raise RuntimeError("OPENAI_API_KEY is not set")
 
-        self.client = OpenAI(api_key=self.api_key)
+        # Initialize the SDK client. If a custom base URL is provided (for proxying
+        # or custom hosting), pass it to the constructor. The OpenAI SDK accepts
+        # `base_url` (or falls back to its default).
+        try:
+            if self.base_url:
+                logger.info("Using custom OpenAI base URL: %s", self.base_url)
+                self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
+            else:
+                self.client = OpenAI(api_key=self.api_key)
+        except TypeError:
+            # In case the installed SDK uses a different kwarg name, try api_base.
+            if self.base_url:
+                self.client = OpenAI(api_key=self.api_key, api_base=self.base_url)  # type: ignore[arg-type]
+            else:
+                self.client = OpenAI(api_key=self.api_key)
 
     def generate_response(self, prompt: str, temperature: float = 0.2, max_tokens: int = 200) -> LLMResponse:
         try:
@@ -48,6 +64,19 @@ class OpenAIClient:
             logger.exception("OpenAI API call failed")
             raise
 
-        text = (resp.choices[0].message.content or "").strip() if resp.choices else ""
-        raw: Dict[str, Any] = resp.model_dump()  # type: ignore[no-any-return]
+        # Parse text content (SDK response shape may vary).
+        try:
+            text = (resp.choices[0].message.content or "").strip() if getattr(resp, "choices", None) else ""
+        except Exception:
+            text = str(resp)
+
+        # Turn the SDK response into a serializable raw dict when possible.
+        raw: Dict[str, Any]
+        try:
+            raw = resp.model_dump()  # type: ignore[no-any-return]
+        except Exception:
+            try:
+                raw = dict(resp)
+            except Exception:
+                raw = {"repr": repr(resp)}
         return LLMResponse(text=text, raw=raw)
